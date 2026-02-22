@@ -1,0 +1,1008 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Quant Trading Engine - Monolithic Single File Version
+Designed for advanced strategy execution (VCP, PEAD) with strict data integrity (Split vs Div Adjusted)
+and robust validation (PBO/CSCV).
+"""
+
+import os
+import sys
+import logging
+import argparse
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from itertools import combinations
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from abc import ABC, abstractmethod
+from dotenv import load_dotenv
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load Env
+load_dotenv()
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+
+# --- API Configuration ---
+FMP_API_KEY = os.getenv("FMP_API_KEY")
+BASE_URL = "https://financialmodelingprep.com/api/v3"
+TIMEOUT = 30
+MAX_RETRIES = 5
+
+if not FMP_API_KEY:
+    logger.warning("FMP_API_KEY not found in environment variables. Use --mock flag for testing.")
+
+# --- Hard Gates Thresholds ---
+MIN_ROIC = 15.0          # Return on Invested Capital > 15%
+MIN_FCF_YIELD = 10.0     # Free Cash Flow Yield > 10%
+MIN_OCF = 0              # Operating Cash Flow > 0 (Positive)
+MIN_ADTV = 1_000_000     # Average Daily Trading Volume (Currency Value) threshold (e.g. $1M)
+
+# --- Market Regime Thresholds ---
+BREADTH_LOOKBACK = 20
+
+# --- Strategy Thresholds ---
+VCP_MAX_RMV = 15.0       # Relative Measured Volatility < 15
+PEAD_DECAY_FACTOR = 0.95 # Time decay factor for PEAD
+
+# --- Risk Management ---
+ATR_MULTIPLIER = 3.0     # Chandelier Exit Multiplier
+KELLY_FRACTION = 0.5     # Half-Kelly
+
+
+# ==============================================================================
+# 2. ANALYSIS LIBRARIES (TECHNICALS & REGIME)
+# ==============================================================================
+
+class TechnicalIndicators:
+    """
+    Library for calculating technical indicators on Split-Adjusted OHLC.
+    """
+    
+    @staticmethod
+    def calculate_atr(df, period=14):
+        """Calculates Average True Range."""
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        prev_close = close.shift(1)
+        
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low - prev_close).abs()
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+
+    @staticmethod
+    def calculate_rmv(df, period=20):
+        """
+        Relative Measured Volatility (RMV).
+        (StdDev / Mean) * 100
+        """
+        close = df['Close']
+        std = close.rolling(window=period).std()
+        mean = close.rolling(window=period).mean()
+        
+        rmv = (std / mean) * 100
+        return rmv
+
+    @staticmethod
+    def detect_vcp(df, lookback=20):
+        """
+        Detects Volatility Contraction Pattern (VCP).
+        Logic:
+        1. RMV < VCP_MAX_RMV (15)
+        2. Volume contracting (optional, but good for VCP)
+        """
+        if df is None or len(df) < lookback:
+            return False, 100.0
+
+        rmv_series = TechnicalIndicators.calculate_rmv(df, period=lookback)
+        current_rmv = rmv_series.iloc[-1]
+        
+        # Check if RMV is low enough
+        is_contracted = current_rmv < VCP_MAX_RMV
+        
+        return is_contracted, current_rmv
+
+    @staticmethod
+    def calculate_sma(df, period):
+        return df['Close'].rolling(window=period).mean()
+
+    @staticmethod
+    def get_breakout_level(df, lookback=20):
+        """Returns the highest high of the last N days."""
+        return df['High'].rolling(window=lookback).max().iloc[-1]
+
+
+# ==============================================================================
+# 3. DATA LAYER (STORE & LOADER)
+# ==============================================================================
+
+class DataStore:
+    def __init__(self):
+        # We will store data in a dictionary of DataFrames or a MultiIndex DataFrame
+        # Structure: {ticker: DataFrame}
+        self.prices = {} 
+        self.financials = {}
+    
+    def add_price_data(self, ticker, df_raw, splits=None):
+        """
+        Processes raw FMP price data into:
+        1. 'Close_Adj': Fully Adjusted (Split + Dividend) -> For Returns
+        2. 'Close_SplitAdj': Split Adjusted Only -> For Technicals (VCP, Patterns)
+        """
+        if df_raw is None or df_raw.empty:
+            return
+
+        df = df_raw.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+
+        # FMP 'adjClose' is usually fully adjusted (Splits + Dividends).
+        # FMP 'close' is raw.
+        
+        df.rename(columns={
+            'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close_Raw',
+            'adjClose': 'Close_Returns', 'volume': 'Volume'
+        }, inplace=True)
+
+        # Calculate Split-Adjusted Close (Technicals)
+        # 1. Initialize with Raw Close
+        df['Close_Technicals'] = df['Close_Raw']
+        
+        # 2. Apply Splits (Reverse Calculation or forward based on cumulative factor)
+        # Typically we adjust historical prices backwards.
+        # If a 2:1 split happened yesterday, today's price is half. 
+        # Historical raw prices (before split) need to be divided by 2 to match today.
+        
+        cum_split_factor = pd.Series(1.0, index=df.index)
+        
+        if splits:
+            for split in splits:
+                s_date = pd.to_datetime(split.get('date'))
+                num = split.get('numerator', 1.0)
+                den = split.get('denominator', 1.0)
+                
+                if num > 0 and den > 0:
+                    ratio = num / den
+                    factor = 1.0 / ratio
+                    mask = df.index < s_date
+                    cum_split_factor.loc[mask] *= factor
+
+        df['Close_Technicals'] = df['Close_Raw'] * cum_split_factor
+        
+        # Standardize columns
+        cols = ['Open', 'High', 'Low', 'Close_Raw', 'Close_Returns', 'Close_Technicals', 'Volume']
+        self.prices[ticker] = df[[c for c in cols if c in df.columns]]
+
+    def add_financial_data(self, ticker, metrics, cash_flow, earnings=None):
+        """
+        Stores financial data including Earnings Surprises.
+        """
+        self.financials[ticker] = {
+            'metrics': metrics,
+            'cash_flow': cash_flow,
+            'earnings': earnings
+        }
+
+    def get_technicals_ohlc(self, ticker):
+        """Returns DataFrame with Split-Adjusted OHL(Close_Technicals)"""
+        if ticker in self.prices:
+            df = self.prices[ticker].copy()
+            # Approximation: Scale Open/High/Low by the ratio of Close_Technicals/Close_Raw
+            # This adjusts OHL for splits (and dividends if Technicals=Returns)
+            # If Technicals is ONLY split adjusted, this reconstructs the split-adj OHL.
+            
+            # Avoid division by zero
+            mask = df['Close_Raw'] != 0
+            ratio = df.loc[mask, 'Close_Technicals'] / df.loc[mask, 'Close_Raw']
+            
+            df['Open'] = df['Open'] * ratio
+            df['High'] = df['High'] * ratio
+            df['Low'] = df['Low'] * ratio
+            df['Close'] = df['Close_Technicals']
+            return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        return None
+
+    def get_returns_close(self, ticker):
+        """Returns Series of Dividend-Adjusted Close"""
+        if ticker in self.prices:
+            return self.prices[ticker]['Close_Returns']
+        return None
+
+
+class FMPDataLoader:
+    def __init__(self, api_key=FMP_API_KEY):
+        self.api_key = api_key
+        self.session = requests.Session()
+        self.base_url = BASE_URL
+
+    def _get_json(self, endpoint, params=None):
+        """Helper to make GET request with retries."""
+        if params is None:
+            params = {}
+        params['apikey'] = self.api_key
+        url = f"{self.base_url}/{endpoint}"
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.session.get(url, params=params, timeout=TIMEOUT)
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:
+                    logger.warning(f"Rate limit hit for {url}. Retrying...")
+                    # Exponential backoff? Simple sleep for now.
+                    import time
+                    time.sleep(1 + attempt)
+                else:
+                    logger.error(f"Error {response.status_code} fetching {url}: {response.text}")
+                    return None
+            except requests.RequestException as e:
+                logger.error(f"Request failed for {url}: {e}")
+        return None
+
+    def get_bulk_financials(self, tickers):
+        """
+        Fetches Key Metrics, Cash Flow, AND Earnings Surprises in bulk (threaded).
+        """
+        results = {}
+        
+        def fetch_metrics(ticker):
+            # Key Metrics TTM
+            km = self._get_json(f"key-metrics-ttm/{ticker}")
+            # Cash Flow Statement
+            cf = self._get_json(f"cash-flow-statement/{ticker}", params={'limit': 4}) 
+            # Earnings Surprises (Recent 1)
+            ern = self._get_json(f"earnings-surprises/{ticker}", params={'limit': 1})
+            
+            return ticker, km, cf, ern
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_ticker = {executor.submit(fetch_metrics, tk): tk for tk in tickers}
+            for future in as_completed(future_to_ticker):
+                tk, km, cf, ern = future.result()
+                
+                # Format earnings for store
+                e_data = None
+                if ern and isinstance(ern, list) and len(ern) > 0:
+                    try:
+                        latest = ern[0]
+                        act = latest.get('actualEarningResult')
+                        est = latest.get('estimatedEarning')
+                        date = latest.get('date')
+                        
+                        surp_pct = 0
+                        if act and est:
+                            surp_pct = ((act - est) / abs(est)) * 100 if est != 0 else 0
+                            
+                        e_data = {'date': date, 'surprise_pct': surp_pct}
+                    except:
+                        pass
+
+                results[tk] = {'metrics': km, 'cash_flow': cf, 'earnings': e_data}
+                
+        return results
+
+    def get_historical_prices(self, tickers, start_date=None):
+        """
+        Fetches historical prices for a list of tickers.
+        Returns a dictionary of DataFrames.
+        """
+        results = {}
+        
+        def fetch_price(ticker):
+            params = {}
+            if start_date:
+                params['from'] = start_date
+            
+            data = self._get_json(f"historical-price-full/{ticker}", params=params)
+            if data and 'historical' in data:
+                df = pd.DataFrame(data['historical'])
+                df['symbol'] = ticker
+                return ticker, df
+            return ticker, None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_ticker = {executor.submit(fetch_price, tk): tk for tk in tickers}
+            for future in as_completed(future_to_ticker):
+                tk, df = future.result()
+                if df is not None:
+                    results[tk] = df
+        
+        return results
+
+    def get_splits(self, tickers):
+        """
+        Fetches split history to calculate split-adjusted prices manually if needed.
+        """
+        results = {}
+        def fetch_split(ticker):
+            data = self._get_json(f"historical-price-full/stock_split/{ticker}")
+            if data and 'historical' in data:
+                return ticker, data['historical']
+            return ticker, []
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch_split, tk): tk for tk in tickers}
+            for future in as_completed(futures):
+                tk, splits = future.result()
+                results[tk] = splits
+        return results
+
+
+# ==============================================================================
+# 4. UNIVERSE & REGIME
+# ==============================================================================
+
+class UniverseSelector:
+    """
+    Applies Hard Gates (Filtering) to the universe of stocks.
+    """
+    def __init__(self, data_store):
+        """
+        Args:
+            data_store (DataStore): The data store containing financials and prices.
+        """
+        self.store = data_store
+
+    def filter_universe(self, tickers):
+        """
+        Filters the list of tickers based on Hard Gates.
+        Returns: list of valid tickers.
+        """
+        valid_tickers = []
+        rejected = {
+            'value_trap': [],
+            'liquidity': [],
+            'missing_data': []
+        }
+
+        for ticker in tickers:
+            # 1. Check Data Availability
+            if ticker not in self.store.financials or ticker not in self.store.prices:
+                rejected['missing_data'].append(ticker)
+                continue
+
+            financials = self.store.financials[ticker]
+            prices = self.store.prices[ticker]
+            
+            # --- Gate 1: Liquidity (ADTV) ---
+            # Calculate ADTV using last 20 days: Price * Volume
+            if prices.empty or len(prices) < 20:
+                rejected['liquidity'].append(ticker)
+                continue
+                
+            last_20 = prices.tail(20)
+            adtv = (last_20['Close_Technicals'] * last_20['Volume']).mean()
+            
+            if adtv < MIN_ADTV:
+                rejected['liquidity'].append(ticker)
+                continue
+
+            # --- Gate 2: Value Trap (Fundamentals) ---
+            metrics = financials.get('metrics', [])
+            cash_flow = financials.get('cash_flow', [])
+            
+            if not metrics or not cash_flow:
+                rejected['missing_data'].append(ticker)
+                continue
+            
+            try:
+                latest_metric = metrics[0] if isinstance(metrics, list) and metrics else {}
+                latest_cf = cash_flow[0] if isinstance(cash_flow, list) and cash_flow else {}
+
+                roic = latest_metric.get('roicTTM', latest_metric.get('roic', 0))
+                if roic is None: roic = 0
+                
+                # FCF Yield = FCF / MarketCap
+                fcf = latest_cf.get('freeCashFlow', 0)
+                market_cap = latest_metric.get('marketCapTTM', latest_metric.get('marketCap', 1))
+                
+                if market_cap is None or market_cap == 0:
+                    fcf_yield = 0
+                else:
+                    fcf_yield = (fcf / market_cap) * 100
+                
+                ocf = latest_cf.get('operatingCashFlow', 0)
+                
+                # Check Gates
+                if (roic > MIN_ROIC and 
+                    fcf_yield > MIN_FCF_YIELD and 
+                    ocf > MIN_OCF):
+                    
+                    valid_tickers.append(ticker)
+                else:
+                    rejected['value_trap'].append(ticker)
+                    
+            except Exception as e:
+                logger.error(f"Error filtering {ticker}: {e}")
+                rejected['missing_data'].append(ticker)
+                
+        logger.info(f"Universe Filter: {len(tickers)} -> {len(valid_tickers)} passed.")
+        logger.info(f"Rejections: ValueTrap={len(rejected['value_trap'])}, Liquidity={len(rejected['liquidity'])}")
+        
+        return valid_tickers
+
+
+class MarketRegime:
+    """
+    Calculates Market Breadth indicators to determine the regime.
+    Uses the provided universe of stocks to aggregate internal data.
+    """
+    def __init__(self, data_store):
+        self.store = data_store
+        self.breadth_df = None
+
+    def calculate_breadth(self):
+        """
+        Aggregates Advancers, Decliners, Up Volume, Down Volume across the universe.
+        """
+        closes = {}
+        volumes = {}
+        
+        for ticker, df in self.store.prices.items():
+            # Use 'Close_Technicals' for breadth as it reflects price action
+            closes[ticker] = df['Close_Technicals']
+            volumes[ticker] = df['Volume']
+            
+        if not closes:
+            return None
+
+        df_close = pd.DataFrame(closes)
+        df_vol = pd.DataFrame(volumes)
+        
+        # Calculate daily changes
+        df_change = df_close.diff()
+        
+        # 2. Calculate Daily Breadth Stats
+        # Advancers: Change > 0
+        advancers = (df_change > 0).sum(axis=1)
+        decliners = (df_change < 0).sum(axis=1)
+        
+        # Up Volume: Volume where Change > 0
+        up_vol = df_vol[df_change > 0].sum(axis=1)
+        down_vol = df_vol[df_change < 0].sum(axis=1)
+        
+        breadth = pd.DataFrame({
+            'advancers': advancers,
+            'decliners': decliners,
+            'up_vol': up_vol,
+            'down_vol': down_vol
+        })
+        
+        # 3. Calculate Indicators
+        
+        # ADL (Advance-Decline Line)
+        breadth['net_advances'] = breadth['advancers'] - breadth['decliners']
+        breadth['adl'] = breadth['net_advances'].cumsum()
+        
+        # McClellan Oscillator
+        # 10% EMA (~19 days) and 5% EMA (~39 days) of Net Advances
+        ema_fast = breadth['net_advances'].ewm(span=19, adjust=False).mean()
+        ema_slow = breadth['net_advances'].ewm(span=39, adjust=False).mean()
+        breadth['mcclellan_osc'] = ema_fast - ema_slow
+        
+        # TRIN (Arms Index)
+        # (Adv / Dec) / (Up Vol / Down Vol)
+        ratio_ad = breadth['advancers'] / breadth['decliners'].replace(0, 1)
+        ratio_vol = breadth['up_vol'] / breadth['down_vol'].replace(0, 1)
+        breadth['trin'] = ratio_ad / ratio_vol.replace(0, 1)
+        
+        self.breadth_df = breadth
+        return breadth
+
+    def get_regime(self):
+        """
+        Returns simple regime flag: 'Bull', 'Bear', or 'Neutral'.
+        Based on McClellan Oscillator and ADL Trend.
+        """
+        if self.breadth_df is None:
+            self.calculate_breadth()
+            
+        if self.breadth_df is None or self.breadth_df.empty:
+            return "Neutral"
+            
+        last_row = self.breadth_df.iloc[-1]
+        
+        # Simple Logic for 'Switch':
+        # If McClellan > 0, Short-term Bullish
+        # If TRIN < 1.0, Bullish pressure
+        
+        score = 0
+        if last_row['mcclellan_osc'] > 0: score += 1
+        else: score -= 1
+        
+        if last_row['trin'] < 1.0: score += 1
+        elif last_row['trin'] > 2.0: score -= 1 # Strong selling
+        
+        if score > 0: return "Bull"
+        elif score < 0: return "Bear"
+        else: return "Neutral"
+
+
+# ==============================================================================
+# 5. STRATEGY MODULES
+# ==============================================================================
+
+class Strategy(ABC):
+    """
+    Abstract Base Class for all strategies.
+    Ensures modularity and consistent interface.
+    """
+    
+    def __init__(self, name):
+        self.name = name
+
+    @abstractmethod
+    def generate_signal(self, ticker, data_store, market_regime=None):
+        pass
+
+
+class VCPStrategy(Strategy):
+    """
+    Volatility Contraction Pattern (VCP) Breakout Strategy.
+    Only active in Bullish Market Regime.
+    """
+    
+    def __init__(self):
+        super().__init__("VCP_Breakout")
+        
+    def generate_signal(self, ticker, data_store, market_regime=None):
+        # 1. Regime Filter: Only active in Bull markets
+        if market_regime != "Bull":
+            return {'signal': False, 'reason': 'Regime not Bull'}
+
+        # 2. Get Data
+        df = data_store.get_technicals_ohlc(ticker)
+        if df is None or len(df) < 50:
+            return {'signal': False, 'reason': 'Insufficient Data'}
+            
+        # 3. Analyze Volatility (RMV)
+        # Using 20-day RMV
+        rmv = TechnicalIndicators.calculate_rmv(df, period=20)
+        current_rmv = rmv.iloc[-1]
+        
+        # 4. Analyze Pattern (Contraction)
+        if current_rmv > VCP_MAX_RMV:
+            return {'signal': False, 'reason': f'High Volatility (RMV={current_rmv:.2f})'}
+            
+        # 5. Detect Pivot / Breakout
+        # Simple Pivot: Highest High of last 20 days (excluding today if running live, or including if EOD)
+        
+        # Lookback excluding today
+        pivot_high = df['High'].iloc[-21:-1].max()
+        current_close = df['Close'].iloc[-1]
+        
+        # Check if price is tight (within 5% of pivot) or breaking out
+        dist_to_pivot = (current_close / pivot_high) - 1.0
+        
+        # Signal Logic:
+        # If RMV is low AND Price is near pivot (-2% to +2%), it's a setup.
+        # Or if it just broke out today.
+        
+        is_setup = -0.05 <= dist_to_pivot <= 0.02
+        
+        if is_setup:
+            return {
+                'signal': True,
+                'confidence': 1.0 - (current_rmv / 100.0), # Lower RMV = Higher Confidence
+                'meta': {
+                    'rmv': current_rmv,
+                    'pivot': pivot_high,
+                    'close': current_close
+                },
+                'strategy': self.name
+            }
+            
+        return {'signal': False, 'reason': 'No Setup'}
+
+
+class PEADStrategy(Strategy):
+    """
+    Post-Earnings Announcement Drift (PEAD) Strategy.
+    Capitalizes on earnings surprises with time decay.
+    """
+    
+    def __init__(self):
+        super().__init__("PEAD_Momentum")
+        
+    def generate_signal(self, ticker, data_store, market_regime=None):
+        # 1. Get Fundamentals
+        if ticker not in data_store.financials:
+            return {'signal': False, 'reason': 'No Financials'}
+            
+        earnings_data = data_store.financials[ticker].get('earnings', None)
+        
+        if not earnings_data:
+            return {'signal': False, 'reason': 'No Earnings Data'}
+            
+        date_str = earnings_data.get('date')
+        surprise = earnings_data.get('surprise_pct')
+        
+        if not date_str or not surprise:
+            return {'signal': False, 'reason': 'Incomplete Earnings Data'}
+            
+        # 2. Calculate Time Decay
+        try:
+            e_date = pd.to_datetime(date_str)
+            today = pd.to_datetime(datetime.today().date())
+            days_elapsed = (today - e_date).days
+        except:
+            return {'signal': False, 'reason': 'Date Parse Error'}
+            
+        if days_elapsed < 0:
+             return {'signal': False, 'reason': 'Earnings in Future'}
+             
+        if days_elapsed > 60:
+             return {'signal': False, 'reason': 'Earnings too old (>60d)'}
+
+        # Decay Logic
+        time_weight = PEAD_DECAY_FACTOR ** days_elapsed 
+        
+        # 3. Generate Signal
+        if surprise > 10.0:
+            confidence = (surprise / 100.0) * time_weight
+            confidence = min(confidence, 1.0) # Cap at 1.0
+            
+            return {
+                'signal': True,
+                'confidence': confidence,
+                'meta': {
+                    'days_elapsed': days_elapsed,
+                    'surprise': surprise,
+                    'time_weight': time_weight
+                },
+                'strategy': self.name
+            }
+            
+        return {'signal': False, 'reason': 'Low Surprise'}
+
+
+# ==============================================================================
+# 6. PORTFOLIO & RISK
+# ==============================================================================
+
+class PositionSizer:
+    """
+    Handles capital allocation logic.
+    """
+    
+    @staticmethod
+    def calculate_volatility_weights(tickers, data_store, lookback=14):
+        """
+        Calculates weights inversely proportional to volatility (ATR).
+        """
+        inverse_vols = {}
+        total_inv_vol = 0.0
+        
+        for ticker in tickers:
+            df = data_store.get_technicals_ohlc(ticker)
+            if df is None or len(df) < lookback:
+                continue
+                
+            atr_series = TechnicalIndicators.calculate_atr(df, period=lookback)
+            current_atr = atr_series.iloc[-1]
+            close = df['Close'].iloc[-1]
+            
+            # ATR as a percentage of price
+            if close > 0:
+                atr_pct = current_atr / close
+            else:
+                atr_pct = 1.0 # fallback
+                
+            if atr_pct > 0:
+                inv_vol = 1.0 / atr_pct
+                inverse_vols[ticker] = inv_vol
+                total_inv_vol += inv_vol
+                
+        # Normalize
+        weights = {}
+        if total_inv_vol > 0:
+            for tk, val in inverse_vols.items():
+                weights[tk] = val / total_inv_vol
+                
+        return weights
+
+
+class RiskManager:
+    """
+    Handles Exit Logic: Pattern Failure and Chandelier Exit.
+    """
+    
+    def __init__(self, data_store):
+        self.store = data_store
+        
+    def check_exit(self, ticker, entry_price, current_date, strategy_type="VCP"):
+        """
+        Checks if a position should be closed.
+        """
+        df = self.store.get_technicals_ohlc(ticker)
+        if df is None or df.empty:
+            return {'exit': False, 'reason': None}
+            
+        current_close = df['Close'].iloc[-1]
+        
+        # 1. Calculate ATR
+        atr_series = TechnicalIndicators.calculate_atr(df)
+        current_atr = atr_series.iloc[-1]
+        
+        # 2. Chandelier Exit (Trailing Stop)
+        highest_high = df['High'].tail(22).max() 
+        chandelier_stop = highest_high - (current_atr * ATR_MULTIPLIER)
+        
+        if current_close < chandelier_stop:
+            return {
+                'exit': True,
+                'reason': 'Chandelier Exit',
+                'price': chandelier_stop
+            }
+            
+        # 3. Pattern Failure (Stop Loss)
+        hard_stop = entry_price * 0.92 # 8% max loss
+        if current_close < hard_stop:
+            return {
+                'exit': True,
+                'reason': 'Hard Stop (Pattern Failure)',
+                'price': hard_stop
+            }
+            
+        return {'exit': False, 'reason': None, 'stop_level': chandelier_stop}
+
+
+# ==============================================================================
+# 7. VALIDATION & BACKTEST
+# ==============================================================================
+
+class ValidationEngine:
+    """
+    Implements CSCV (Combinatorial Symmetric Cross-Validation) and PBO (Probability of Backtest Overfitting).
+    """
+    
+    def __init__(self, n_splits=10):
+        self.n_splits = n_splits
+
+    def calculate_pbo(self, strategy_returns_df):
+        """
+        Calculates PBO given a DataFrame where each column is a different strategy/parameter set configuration
+        and the index is time (returns).
+        """
+        T, N = strategy_returns_df.shape
+        if T < self.n_splits * 2:
+            return 0.0, [] # Insufficient data
+
+        chunk_size = T // self.n_splits
+        chunks = [strategy_returns_df.iloc[i*chunk_size : (i+1)*chunk_size] for i in range(self.n_splits)]
+        
+        k = self.n_splits // 2
+        
+        combs = list(combinations(range(self.n_splits), k))
+        
+        logits = []
+        
+        for train_indices in combs:
+            train_indices = set(train_indices)
+            test_indices = set(range(self.n_splits)) - train_indices
+            
+            # Form Train/Test sets
+            train_data = pd.concat([chunks[i] for i in train_indices])
+            test_data = pd.concat([chunks[i] for i in test_indices])
+            
+            # Calculate Performance (Sharpe Ratio) on Train
+            train_sharpe = self._sharpe(train_data)
+            
+            # Find the "Best" strategy in-sample (IS)
+            best_strategy_idx = np.argmax(train_sharpe)
+            
+            # Calculate Performance on Test (OOS) for the IS-Best strategy
+            test_sharpe = self._sharpe(test_data)
+            oos_performance_of_best = test_sharpe.iloc[best_strategy_idx]
+            
+            median_oos = np.median(test_sharpe)
+            if oos_performance_of_best < median_oos:
+                logits.append(1)
+            else:
+                logits.append(0)
+                
+        pbo = np.mean(logits)
+        return pbo, logits
+
+    def _sharpe(self, returns_df):
+        # Annualized Sharpe (assuming daily data)
+        mean = returns_df.mean()
+        std = returns_df.std()
+        return (mean / std) * np.sqrt(252)
+
+
+# ==============================================================================
+# 8. MOCK DATA LOADER (FOR TESTING)
+# ==============================================================================
+
+class MockLoader:
+    """Mock Data Loader for testing without API Key"""
+    def get_historical_prices(self, tickers, start_date=None):
+        data = {}
+        dates = pd.date_range(end=datetime.today(), periods=200)
+        for tk in tickers:
+            price = 100 + np.cumsum(np.random.normal(0.1, 2, 200))
+            high = price + np.random.uniform(0, 2, 200)
+            low = price - np.random.uniform(0, 2, 200)
+            vol = np.random.randint(100000, 5000000, 200)
+            
+            df = pd.DataFrame({
+                'date': dates,
+                'open': price, 'high': high, 'low': low, 'close': price,
+                'adjClose': price, 'volume': vol
+            })
+            data[tk] = df
+        return data
+
+    def get_bulk_financials(self, tickers):
+        data = {}
+        for tk in tickers:
+            # Pass all gates by default for mock
+            data[tk] = {
+                'metrics': [{'roicTTM': 20, 'marketCapTTM': 1e9}],
+                'cash_flow': [{'freeCashFlow': 2e8, 'operatingCashFlow': 3e8}],
+                'earnings': {'date': (datetime.today() - timedelta(days=10)).strftime('%Y-%m-%d'), 'surprise_pct': 15.0}
+            }
+        return data
+
+    def get_splits(self, tickers):
+        return {tk: [] for tk in tickers}
+
+
+# ==============================================================================
+# 9. MAIN EXECUTION
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='Run Quant System (Monolith)')
+    parser.add_argument('--mock', action='store_true', help='Run with mock data')
+    args = parser.parse_args()
+
+    logger.info("Starting Quant Engine (Monolith)...")
+    
+    if args.mock:
+        logger.info("Running in MOCK mode.")
+        loader = MockLoader()
+    else:
+        if not FMP_API_KEY:
+            logger.error("FMP_API_KEY not found. Please set it in .env or environment variables.")
+            return
+        loader = FMPDataLoader()
+
+    # 1. Initialize Modules
+    store = DataStore()
+    
+    # 2. Define Universe
+    tickers = [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "AMD", "NFLX", "INTC"
+    ]
+    logger.info(f"Universe Size: {len(tickers)} tickers")
+
+    # 3. Load Data (Bulk)
+    logger.info("Fetching Historical Prices...")
+    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    hist_data = loader.get_historical_prices(tickers, start_date=start_date)
+
+    logger.info("Fetching Splits...")
+    splits_data = loader.get_splits(tickers)
+    
+    logger.info("Fetching Financials...")
+    fin_data = loader.get_bulk_financials(tickers)
+    
+    # Store Data
+    for tk, df in hist_data.items():
+        tk_splits = splits_data.get(tk, [])
+        store.add_price_data(tk, df, splits=tk_splits)
+        
+    for tk, data in fin_data.items():
+        store.add_financial_data(tk, data['metrics'], data['cash_flow'], data.get('earnings'))
+
+    # 4. Filter Universe (Hard Gates)
+    logger.info("Applying Hard Gates (Universe Selection)...")
+    selector = UniverseSelector(store)
+    valid_tickers = selector.filter_universe(tickers)
+    logger.info(f"Valid Tickers: {len(valid_tickers)} / {len(tickers)}")
+
+    if not valid_tickers:
+        logger.warning("No tickers passed the filter. Exiting.")
+        return
+
+    # 5. Analyze Market Regime
+    logger.info("Analyzing Market Regime...")
+    regime_analyzer = MarketRegime(store)
+    regime_analyzer.calculate_breadth() # Calculate first
+    market_regime = regime_analyzer.get_regime()
+    
+    if args.mock:
+        market_regime = "Bull"
+        
+    logger.info(f"Market Regime: {market_regime}")
+
+    # 6. Run Strategies
+    logger.info("Running Strategies...")
+    strategies = [VCPStrategy(), PEADStrategy()]
+    signals = []
+
+    for ticker in valid_tickers:
+        for strategy in strategies:
+            try:
+                sig = strategy.generate_signal(ticker, store, market_regime)
+                if sig['signal']:
+                    logger.info(f"Signal Found: {ticker} - {sig['strategy']} (Conf: {sig['confidence']:.2f})")
+                    signals.append({
+                        'ticker': ticker,
+                        'strategy': sig['strategy'],
+                        'confidence': sig['confidence'],
+                        'meta': sig['meta']
+                    })
+            except Exception as e:
+                logger.error(f"Error running strategy on {ticker}: {e}")
+
+    # 7. Portfolio Construction
+    if signals:
+        signal_df = pd.DataFrame(signals)
+        signal_tickers = signal_df['ticker'].unique().tolist()
+        
+        # Sizing
+        logger.info("Calculating Position Sizes (Volatility Inverse)...")
+        weights = PositionSizer.calculate_volatility_weights(signal_tickers, store)
+        
+        # Risk Management
+        risk_manager = RiskManager(store)
+        
+        print("\n=== Recommended Portfolio Action ===")
+        print(f"Regime: {market_regime}")
+        print("-" * 80)
+        print(f"{'Ticker':<8} {'Strategy':<15} {'Weight':<10} {'Stop Level':<10} {'Conf':<10} {'Reason'}")
+        print("-" * 80)
+        
+        for sig in signals:
+            tk = sig['ticker']
+            wt = weights.get(tk, 0.0)
+            
+            # Get latest price for context
+            df = store.get_technicals_ohlc(tk)
+            price = df['Close'].iloc[-1] if df is not None else 0
+            
+            # Calculate Stop Level (Initial)
+            atr_series = TechnicalIndicators.calculate_atr(df)
+            current_atr = atr_series.iloc[-1]
+            stop_price = price - (2.0 * current_atr) # simplified initial stop
+            
+            print(f"{tk:<8} {sig['strategy']:<15} {wt:.1%}{'':<5} {stop_price:.2f}{'':<5} {sig['confidence']:.2f}{'':<5} Buy Signal")
+            
+        print("-" * 80)
+    else:
+        logger.info("No actionable signals generated.")
+
+    # 8. Validation Demo (PBO)
+    logger.info("\nRunning Validation Demo (PBO Calculation)...")
+    validator = ValidationEngine(n_splits=4)
+    
+    np.random.seed(42)
+    dates = pd.date_range(start='2022-01-01', periods=200)
+    strategies_returns = pd.DataFrame(
+        np.random.normal(0.0005, 0.01, size=(200, 5)), 
+        index=dates, 
+        columns=[f'Strat_{i}' for i in range(5)]
+    )
+    strategies_returns['Strat_0'] += 0.0002
+    
+    pbo, logits = validator.calculate_pbo(strategies_returns)
+    logger.info(f"Calculated PBO for demo strategies: {pbo:.4f}")
+
+if __name__ == "__main__":
+    main()
